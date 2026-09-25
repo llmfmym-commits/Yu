@@ -1,0 +1,100 @@
+name: Build HandFont Creator APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Package APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP (if the repo root only has a .zip)
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -iname "*.zip" | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found $ZIP_FILE — extracting into repo root"
+            TMP_DIR=$(mktemp -d)
+            unzip -q "$ZIP_FILE" -d "$TMP_DIR"
+            ENTRY_COUNT=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | wc -l)
+            if [ "$ENTRY_COUNT" -eq 1 ] && [ -d "$(find "$TMP_DIR" -mindepth 1 -maxdepth 1)" ]; then
+              SRC_DIR=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1)
+            else
+              SRC_DIR="$TMP_DIR"
+            fi
+            cp -rf "$SRC_DIR"/. .
+            rm -rf "$TMP_DIR"
+            echo "Extraction complete."
+          else
+            echo "No .zip found in repo root — assuming project is already unzipped."
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Install required Android SDK packages
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "Using SDK root: $SDK_ROOT"
+          SDKMANAGER=$(find "$SDK_ROOT" -type f -name "sdkmanager" 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDK_ROOT"
+            exit 1
+          fi
+          echo "Found sdkmanager at: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Provision Gradle (bootstraps this repo's ./gradlew)
+        run: |
+          if [ ! -x "./gradlew" ]; then
+            gradle wrapper --gradle-version 9.3.1
+          fi
+          chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HandFontCreator-Debug-APK
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Prepare Signing and Build Release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Decoding release keystore..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/release.jks
+            export KEYSTORE_PATH="/tmp/release.jks"
+            ./gradlew assembleRelease --stacktrace
+            rm -f /tmp/release.jks
+          else
+            echo "No KEYSTORE_BASE64 secret provided. Building unsigned release APK..."
+            ./gradlew assembleRelease --stacktrace
+          fi
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HandFontCreator-Release-APK
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
